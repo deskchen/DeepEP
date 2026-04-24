@@ -3,11 +3,127 @@ import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
-# noinspection PyUnresolvedReferences
-import deep_ep_cpp
-# noinspection PyUnresolvedReferences
-from deep_ep_cpp import Config, EventHandle
+# Phantora: when running under simulation, the C++ runtime is never invoked
+# (every dispatch/combine path is short-circuited to a synthetic flow), so we
+# tolerate `deep_ep_cpp` being absent. Outside Phantora, import as upstream.
+_PHANTORA = os.environ.get('PHANTORA') == '1'
+try:
+    # noinspection PyUnresolvedReferences
+    import deep_ep_cpp
+    # noinspection PyUnresolvedReferences
+    from deep_ep_cpp import Config, EventHandle
+except ImportError:
+    if not _PHANTORA:
+        raise
+    deep_ep_cpp = None
+
+    class Config:  # type: ignore
+        """Phantora stub. Real Config is unused under simulation."""
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class EventHandle:  # type: ignore
+        """Phantora stub. Real EventHandle is unused under simulation."""
+        def current_stream_wait(self):
+            pass
+
 from .utils import EventOverlap, check_nvlink_connections
+
+
+# Phantora simulation helpers ------------------------------------------------
+
+def _phantora_owner_rank(num_experts: int, num_ranks: int) -> torch.Tensor:
+    """Return CPU int64 tensor `[num_experts]` mapping global expert id → owner
+    rank. Mirrors vLLM's `determine_expert_map` partitioning: round-robin with
+    the remainder all going to the last rank."""
+    local = num_experts // num_ranks
+    if local == 0:
+        # Fewer experts than ranks: every expert lives on rank 0..num_experts-1
+        owner = torch.arange(num_experts, dtype=torch.int64)
+        return owner
+    owner = torch.arange(num_experts, dtype=torch.int64) // local
+    # Last rank absorbs the remainder
+    owner.clamp_(max=num_ranks - 1)
+    return owner
+
+
+def _phantora_sendcounts(topk_idx: torch.Tensor, num_experts: int,
+                         num_ranks: int) -> torch.Tensor:
+    """Per-peer token count this rank sends. Each token is sent once per
+    distinct destination rank in its topk (matching DeepEP semantics)."""
+    owner = _phantora_owner_rank(num_experts, num_ranks)
+    # Map invalid (-1) to a sentinel so they don't count
+    safe = topk_idx.detach().to('cpu', dtype=torch.int64)
+    valid = safe.ge(0) & safe.lt(num_experts)
+    safe = safe.clamp(0, num_experts - 1)
+    dest = owner[safe]                              # [num_tokens, topk]
+    dest = dest.where(valid, torch.full_like(dest, -1))
+    sendcounts = torch.zeros(num_ranks, dtype=torch.int64)
+    for r in range(num_ranks):
+        sendcounts[r] = (dest == r).any(dim=1).sum()
+    return sendcounts
+
+
+def _phantora_pick_device_group(group: dist.ProcessGroup) -> dist.ProcessGroup:
+    """Return a NCCL-capable group equivalent to `group`.
+
+    vLLM constructs `deep_ep.Buffer(group=cpu_group)` — a gloo-backed group
+    used only for object exchange. Wire ops (dist.batch_isend_irecv with CUDA
+    tensors) need a NCCL backend so Phantora's libnccl shim can intercept
+    them. If `group` already has NCCL we use it; otherwise look up the EP
+    device_group via vLLM (lazy import to keep deepep usable outside vLLM).
+    """
+    try:
+        if dist.get_backend(group) == 'nccl':
+            return group
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        from vllm.distributed import get_ep_group
+        return get_ep_group().device_group
+    except Exception:
+        return group
+
+
+def _phantora_submit_flows(group: dist.ProcessGroup, sendcounts: torch.Tensor,
+                            recvcounts: torch.Tensor, hidden: int,
+                            local_rank: int, num_ranks: int) -> None:
+    """Submit per-peer dummy bf16 transfers via dist.batch_isend_irecv. Phantora
+    intercepts the underlying ncclSend/ncclRecv pairs and models per-pair flows
+    in the simulator. Bytes never actually move."""
+    if num_ranks <= 1:
+        return
+    group = _phantora_pick_device_group(group)
+    # Allocate one fake bf16 buffer per peer with the right element count.
+    ops = []
+    for r in range(num_ranks):
+        if r == local_rank:
+            continue
+        s_n = int(sendcounts[r].item())
+        r_n = int(recvcounts[r].item())
+        if s_n > 0:
+            send_buf = torch.empty(s_n * hidden, dtype=torch.bfloat16, device='cuda')
+            ops.append(dist.P2POp(dist.isend, send_buf, r, group=group))
+        if r_n > 0:
+            recv_buf = torch.empty(r_n * hidden, dtype=torch.bfloat16, device='cuda')
+            ops.append(dist.P2POp(dist.irecv, recv_buf, r, group=group))
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+
+def _phantora_exchange_sendcounts(sendcounts: torch.Tensor,
+                                   group: dist.ProcessGroup,
+                                   num_ranks: int) -> torch.Tensor:
+    """All-gather sendcounts so this rank knows how many tokens each peer is
+    sending it. Returns recvcounts [num_ranks] (recvcounts[r] = bytes from r)."""
+    group = _phantora_pick_device_group(group)
+    # Gather everyone's sendcounts. all_sendcounts[r, dst] = rank r's send to dst
+    all_sendcounts = torch.zeros(num_ranks * num_ranks, dtype=torch.int64, device='cuda')
+    dist.all_gather_into_tensor(all_sendcounts, sendcounts.cuda(), group=group)
+    all_sendcounts = all_sendcounts.view(num_ranks, num_ranks).cpu()
+    return all_sendcounts
 
 
 class Buffer:
@@ -56,7 +172,10 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
-        check_nvlink_connections(group)
+        # Phantora: skip nvlink topology probing (queries pynvml, which has no
+        # meaningful answer under the simulated CUDA shim).
+        if not _PHANTORA:
+            check_nvlink_connections(group)
 
         # Initialize the CPP runtime
         if group is not None:
@@ -81,6 +200,15 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+
+        # Phantora: skip the entire CPP runtime initialisation. Every dispatch/
+        # combine path checks _PHANTORA and synthesises outputs on CPU, so the
+        # runtime is never accessed. Returning here avoids cudaIpc / nvshmem
+        # calls that would either no-op silently (corrupting state) or fail.
+        if _PHANTORA:
+            self.runtime = None
+            return
+
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy)
 
         # Synchronize device IDs
@@ -132,12 +260,168 @@ class Buffer:
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
 
+        if _PHANTORA:
+            self.runtime = None
+            return
+
         self.runtime.destroy()
         self.runtime = None
+
+    # ----- Phantora simulation shims -------------------------------------
+
+    def _phantora_dispatch(self, x, handle, topk_idx, topk_weights,
+                           num_tokens_per_rank, is_token_in_rank,
+                           num_tokens_per_expert, expert_alignment):
+        """Synthesise dispatch outputs and submit per-pair flows. Inputs follow
+        the upstream signatures of `dispatch` / `internode_dispatch`."""
+        x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
+        device = x_tensor.device
+        hidden = x_tensor.size(1)
+        num_ranks = self.group_size
+        num_experts = (num_tokens_per_expert.numel()
+                       if num_tokens_per_expert is not None
+                       else (topk_idx.max().item() + 1 if topk_idx is not None else 0))
+
+        # Cached path (handle != None): reuse stored counts. Otherwise compute.
+        if handle is not None:
+            sendcounts, recvcounts, all_sendcounts, src_topk_idx, src_topk_weights, \
+                stored_num_experts, stored_local_experts = handle
+            num_experts = stored_num_experts
+        else:
+            assert topk_idx is not None
+            sendcounts = _phantora_sendcounts(topk_idx, num_experts, num_ranks)
+            all_sendcounts = _phantora_exchange_sendcounts(sendcounts, self.group, num_ranks)
+            recvcounts = all_sendcounts[:, self.rank]
+            src_topk_idx = topk_idx
+            src_topk_weights = topk_weights
+
+        # Submit per-pair fake flows. Phantora intercepts ncclSend/Recv.
+        _phantora_submit_flows(self.group, sendcounts, recvcounts,
+                               hidden, self.rank, num_ranks)
+
+        num_recv_tokens = int(recvcounts.sum().item())
+        local_num_experts = max(1, num_experts // num_ranks)
+
+        recv_x = torch.empty(num_recv_tokens, hidden,
+                             dtype=x_tensor.dtype, device=device)
+        recv_x_scales = (torch.empty(num_recv_tokens, x_scales.size(1),
+                                      dtype=x_scales.dtype, device=device)
+                         if x_scales is not None else None)
+        topk = src_topk_idx.size(1) if src_topk_idx is not None else 1
+        recv_topk_idx = torch.empty(num_recv_tokens, topk,
+                                    dtype=torch.int64, device=device)
+        recv_topk_weights = torch.empty(num_recv_tokens, topk,
+                                        dtype=torch.float32, device=device)
+        # vLLM's _do_dispatch later remaps -1 entries; fill with valid local
+        # expert indices so downstream code (including the remapping branch)
+        # sees in-range values.
+        if num_recv_tokens > 0:
+            recv_topk_idx.fill_(0)
+            recv_topk_weights.fill_(1.0 / topk)
+
+        num_recv_tokens_per_expert_list = [
+            num_recv_tokens // local_num_experts
+        ] * local_num_experts
+        # Distribute remainder across the first few experts
+        rem = num_recv_tokens - sum(num_recv_tokens_per_expert_list)
+        for i in range(rem):
+            num_recv_tokens_per_expert_list[i] += 1
+
+        new_handle = (sendcounts, recvcounts, all_sendcounts,
+                      src_topk_idx, src_topk_weights,
+                      num_experts, local_num_experts)
+
+        out_x = (recv_x, recv_x_scales) if x_scales is not None else recv_x
+        return (out_x, recv_topk_idx, recv_topk_weights,
+                num_recv_tokens_per_expert_list, new_handle, EventOverlap(None))
+
+    def _phantora_combine(self, x, handle, topk_weights):
+        """Synthesise combine output and submit reverse-direction flows."""
+        sendcounts, recvcounts, all_sendcounts, src_topk_idx, src_topk_weights, \
+            num_experts, local_num_experts = handle
+        num_ranks = self.group_size
+        # Combine reverses dispatch direction: receive what we previously sent.
+        _phantora_submit_flows(self.group, recvcounts, sendcounts,
+                               x.size(1), self.rank, num_ranks)
+        # Output token count is the original pre-dispatch token count =
+        # the number of rows in src_topk_idx.
+        orig_num_tokens = src_topk_idx.size(0) if src_topk_idx is not None else x.size(0)
+        combined_x = torch.empty(orig_num_tokens, x.size(1),
+                                  dtype=x.dtype, device=x.device)
+        combined_topk_weights = (
+            torch.empty(orig_num_tokens, src_topk_weights.size(1),
+                        dtype=torch.float32, device=x.device)
+            if src_topk_weights is not None else None)
+        return combined_x, combined_topk_weights, EventOverlap(None)
+
+    def _phantora_low_latency_dispatch(self, x, topk_idx,
+                                        num_max_dispatch_tokens_per_rank,
+                                        num_experts, use_fp8, return_recv_hook):
+        """LL-mode dispatch shim. Submits flows; returns shape-correct buffers
+        sized to the per-rank max-dispatch ceiling."""
+        device = x.device
+        hidden = x.size(1)
+        num_ranks = self.group_size
+        sendcounts = _phantora_sendcounts(topk_idx, num_experts, num_ranks)
+        all_sendcounts = _phantora_exchange_sendcounts(sendcounts, self.group, num_ranks)
+        recvcounts = all_sendcounts[:, self.rank]
+        _phantora_submit_flows(self.group, sendcounts, recvcounts,
+                               hidden, self.rank, num_ranks)
+
+        local_num_experts = max(1, num_experts // num_ranks)
+        cap = num_max_dispatch_tokens_per_rank * num_ranks
+        if use_fp8:
+            packed_recv_x = torch.empty(local_num_experts, cap, hidden,
+                                         dtype=torch.float8_e4m3fn, device=device)
+            packed_recv_x_scales = torch.empty(local_num_experts, cap,
+                                                hidden // 128,
+                                                dtype=torch.float32,
+                                                device=device)
+            recv_x_out = (packed_recv_x, packed_recv_x_scales)
+        else:
+            packed_recv_x = torch.empty(local_num_experts, cap, hidden,
+                                         dtype=torch.bfloat16, device=device)
+            recv_x_out = packed_recv_x
+        packed_recv_count = torch.zeros(local_num_experts,
+                                         dtype=torch.int32, device=device)
+        # Distribute received tokens evenly across local experts.
+        total_recv = int(recvcounts.sum().item())
+        per_expert = total_recv // local_num_experts
+        for i in range(local_num_experts):
+            packed_recv_count[i] = per_expert + (1 if i < total_recv - per_expert * local_num_experts else 0)
+
+        # Handle for combine; carry orig_num_tokens (= topk_idx.shape[0]) so
+        # combine can rebuild the output shape.
+        handle = (None, None, num_max_dispatch_tokens_per_rank,
+                  hidden, num_experts, topk_idx.size(0))
+
+        hook = (lambda: None) if return_recv_hook else None
+        return recv_x_out, packed_recv_count, handle, EventOverlap(None), hook
+
+    def _phantora_low_latency_combine(self, x, topk_idx, topk_weights, handle,
+                                       out, return_recv_hook):
+        """LL-mode combine shim."""
+        _, _, num_max_dispatch_tokens_per_rank, hidden, num_experts, orig_num_tokens = handle
+        num_ranks = self.group_size
+        # Fake reverse-direction flow: assume balanced under uniform routing.
+        sendcounts = torch.full((num_ranks,),
+                                 max(1, orig_num_tokens // num_ranks),
+                                 dtype=torch.int64)
+        _phantora_submit_flows(self.group, sendcounts, sendcounts,
+                               hidden, self.rank, num_ranks)
+        if out is not None:
+            combined_x = out
+        else:
+            combined_x = torch.empty(orig_num_tokens, hidden,
+                                      dtype=torch.bfloat16, device=x.device)
+        hook = (lambda: None) if return_recv_hook else None
+        return combined_x, EventOverlap(None), hook
 
 
     @staticmethod
     def is_sm90_compiled():
+        if _PHANTORA:
+            return True
         return deep_ep_cpp.is_sm90_compiled()
 
     @staticmethod
@@ -176,6 +460,10 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
+        if _PHANTORA:
+            # Rough upper-bound formula consistent with DeepEP's docs. Buffer
+            # size is irrelevant under simulation (we never allocate it).
+            return num_max_dispatch_tokens_per_rank * hidden * 2 * num_ranks
         return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     def get_comm_stream(self) -> torch.Stream:
@@ -185,6 +473,8 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
+        if _PHANTORA:
+            return torch.cuda.current_stream()
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
@@ -296,6 +586,33 @@ class Buffer:
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        if _PHANTORA:
+            # Compute layout entirely on CPU from the synthetic topk indices.
+            # No comm cost — vLLM uses these counts only for CPU-side bookkeeping
+            # before calling dispatch (which is where wire flows are submitted).
+            num_ranks = self.group_size
+            owner = _phantora_owner_rank(num_experts, num_ranks)
+            safe = topk_idx.detach().to('cpu', dtype=torch.int64)
+            valid = safe.ge(0) & safe.lt(num_experts)
+            safe = safe.clamp(0, num_experts - 1)
+            dest = owner[safe].where(valid, torch.full_like(safe, -1))
+            num_tokens_per_rank = torch.zeros(num_ranks, dtype=torch.int32)
+            for r in range(num_ranks):
+                num_tokens_per_rank[r] = (dest == r).any(dim=1).sum()
+            num_tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32)
+            flat_valid = safe[valid]
+            if flat_valid.numel() > 0:
+                num_tokens_per_expert.scatter_add_(
+                    0, flat_valid, torch.ones_like(flat_valid, dtype=torch.int32))
+            is_token_in_rank = torch.zeros(
+                topk_idx.shape[0], num_ranks, dtype=torch.bool)
+            for r in range(num_ranks):
+                is_token_in_rank[:, r] = (dest == r).any(dim=1)
+            device = topk_idx.device
+            return (num_tokens_per_rank.to(device), None,
+                    num_tokens_per_expert.to(device),
+                    is_token_in_rank.to(device), EventOverlap(None))
+
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
             self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
                                              async_finish, allocate_on_comm_stream)
@@ -352,6 +669,13 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        # Phantora: synthesise dispatch outputs and submit per-pair flows. Same
+        # code path for intranode and internode — we don't distinguish.
+        if _PHANTORA:
+            return self._phantora_dispatch(
+                x, handle, topk_idx, topk_weights, num_tokens_per_rank,
+                is_token_in_rank, num_tokens_per_expert, expert_alignment)
+
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
@@ -413,6 +737,10 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        # Phantora: synthesise combine output and submit reverse-direction flows.
+        if _PHANTORA:
+            return self._phantora_combine(x, handle, topk_weights)
+
         # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
 
@@ -446,6 +774,10 @@ class Buffer:
         Internode dispatch implementation, for more details, please refer to the `dispatch` docs.
         Normally, you should not directly call this function.
         """
+        if _PHANTORA:
+            return self._phantora_dispatch(
+                x, handle, topk_idx, topk_weights, num_tokens_per_rank,
+                is_token_in_rank, num_tokens_per_expert, expert_alignment)
         assert config is not None
 
         # Launch the kernel with cached or non-cached mode
@@ -494,6 +826,8 @@ class Buffer:
         Internode combine implementation, for more details, please refer to the `combine` docs.
         Normally, you should not directly call this function.
         """
+        if _PHANTORA:
+            return self._phantora_combine(x, handle, topk_weights)
         assert config is not None
 
         # Unpack handle and bias
@@ -524,6 +858,8 @@ class Buffer:
             hidden: the hidden dimension of each token.
             num_experts: the number of all experts.
         """
+        if _PHANTORA:
+            return
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     # noinspection PyTypeChecker
@@ -581,6 +917,11 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        if _PHANTORA:
+            return self._phantora_low_latency_dispatch(
+                x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
+                use_fp8, return_recv_hook)
+
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
@@ -636,6 +977,9 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        if _PHANTORA:
+            return self._phantora_low_latency_combine(
+                x, topk_idx, topk_weights, handle, out, return_recv_hook)
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats,
                                                                    num_max_dispatch_tokens_per_rank, num_experts,
