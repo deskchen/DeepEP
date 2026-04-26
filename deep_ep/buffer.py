@@ -117,13 +117,30 @@ def _phantora_exchange_sendcounts(sendcounts: torch.Tensor,
                                    group: dist.ProcessGroup,
                                    num_ranks: int) -> torch.Tensor:
     """All-gather sendcounts so this rank knows how many tokens each peer is
-    sending it. Returns recvcounts [num_ranks] (recvcounts[r] = bytes from r)."""
-    group = _phantora_pick_device_group(group)
-    # Gather everyone's sendcounts. all_sendcounts[r, dst] = rank r's send to dst
-    all_sendcounts = torch.zeros(num_ranks * num_ranks, dtype=torch.int64, device='cuda')
-    dist.all_gather_into_tensor(all_sendcounts, sendcounts.cuda(), group=group)
-    all_sendcounts = all_sendcounts.view(num_ranks, num_ranks).cpu()
-    return all_sendcounts
+    sending it. Returns recvcounts [num_ranks] (recvcounts[r] = bytes from r).
+
+    Stays on the gloo (CPU) group on purpose — under Phantora the NCCL
+    AllGather is intercepted and returns uninitialised garbage (the shim
+    only models bytes-on-the-wire, it doesn't actually transfer the data).
+    Sendcounts are a tiny int64 metadata tensor (num_ranks² ints), so a
+    real gloo AllGather over OS-level transport is essentially free and
+    gives us correct values for downstream `recv_buf` sizing — getting
+    the real numbers here is what stops `torch.empty(r_n * hidden, ...)`
+    blowing up with "tried to allocate 366 EB" when r_n is garbage."""
+    # If the caller's `group` isn't gloo, find one — vLLM passes us its
+    # cpu_group at Buffer.__init__ which is what we want here.
+    cpu_group = group
+    try:
+        if dist.get_backend(group) != 'gloo':
+            from vllm.distributed import get_ep_group
+            cpu_group = get_ep_group().cpu_group
+    except Exception:
+        pass
+
+    sendcounts_cpu = sendcounts.detach().cpu().contiguous()
+    all_sendcounts = torch.zeros(num_ranks * num_ranks, dtype=torch.int64)
+    dist.all_gather_into_tensor(all_sendcounts, sendcounts_cpu, group=cpu_group)
+    return all_sendcounts.view(num_ranks, num_ranks)
 
 
 class Buffer:
